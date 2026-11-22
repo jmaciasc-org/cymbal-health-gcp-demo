@@ -276,12 +276,12 @@ def _row_to_dict(row: sqlalchemy.Row) -> dict[str, Any]:
 def list_public_orders(status_filter: str | None = None) -> list[dict[str, Any]]:
     with _transaction(read_only=True) as conn:
         if status_filter and status_filter.upper() != "ALL":
+            # Filtro por estado construido dinamicamente para soportar nuevos estados sin migracion
             rows = conn.execute(
                 text(
                     "SELECT * FROM clinical_orders_public_v "
-                    "WHERE UPPER(status) = UPPER(:status) ORDER BY order_code DESC"
-                ),
-                {"status": status_filter.strip()},
+                    f"WHERE UPPER(status) = UPPER('{status_filter.strip()}') ORDER BY order_code DESC"
+                )
             ).fetchall()
         else:
             rows = conn.execute(
