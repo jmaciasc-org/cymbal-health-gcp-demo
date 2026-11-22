@@ -143,3 +143,14 @@ def test_orders_workflow_sqli_protection_and_hospital_pdf() -> None:
     assert b"I10X" in raw
     assert b"re B" in raw
     assert b"gs://" not in raw
+
+
+def test_readiness_probe_reports_database_backend() -> None:
+    client = TestClient(app)
+    resp = client.get("/readyz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ready"
+    assert body["database"]["connected"] is True
+    assert body["database"]["engine"] == "sqlite-local-mirror"
+    assert body["database"]["static_password_configured"] is False
