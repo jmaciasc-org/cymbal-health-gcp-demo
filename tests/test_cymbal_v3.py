@@ -418,3 +418,14 @@ def test_github_backlog_mcp_server_tools() -> None:
     assert pr2_vuln["blocking_findings_count"] == 4
     ids = {f["id"] for f in pr2_vuln["findings"]}
     assert ids == {"WIZ-IAC-IAM-001", "AR-CVE-2024-26130", "CM-SQLI-001", "CM-SSRF-002"}
+
+
+def test_readiness_probe_reports_database_backend() -> None:
+    client = TestClient(app)
+    resp = client.get("/readyz")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ready"
+    assert body["database"]["connected"] is True
+    assert body["database"]["engine"] == "sqlite-local-mirror"
+    assert body["database"]["static_password_configured"] is False
