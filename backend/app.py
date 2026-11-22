@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from backend import APP_NAME, APP_SERVICE_PORTAL, APP_VERSION
 from backend.db import (
+    check_database_connection,
     create_clinical_order,
     get_public_order,
     list_public_orders,
@@ -103,6 +104,18 @@ def healthz() -> dict[str, Any]:
         "version": APP_VERSION,
         "asset_version": _ASSET_VER,
     }
+
+
+@app.get("/readyz")
+def readyz(response: Response) -> dict[str, Any]:
+    """Readiness probe: verifies the database connection (Cloud SQL over private IP with IAM auth)."""
+    database = check_database_connection()
+    connected = bool(database.get("connected"))
+    if not connected:
+        response.status_code = 503
+    response.headers.update(NO_CACHE_HEADERS)
+    # Public response is intentionally minimal; instance, principal and errors go to Cloud Logging only.
+    return {"status": "ready" if connected else "not_ready", "database": {"engine": database["engine"], "connected": connected}}
 
 
 @app.get("/api/orders/defaults")
