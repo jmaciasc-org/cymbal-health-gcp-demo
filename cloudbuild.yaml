@@ -88,6 +88,9 @@ steps:
             try:
                 data = json.loads(raw)
                 res = data.get("result", data)
+                for match in (res.get("failedPolicyMatches") or []):
+                    pol = match.get("policy") or {}
+                    reasons.append(f"Wiz policy failed: {pol.get('name', 'unknown')} ({pol.get('type', '')})")
                 secrets_found = res.get("secrets") or []
                 if secrets_found:
                     reasons.append(f"Wiz Secret Scanner detected {len(secrets_found)} exposed secret(s)")
@@ -104,7 +107,7 @@ steps:
 
         req_txt = pathlib.Path("requirements.txt").read_text(encoding="utf-8") if pathlib.Path("requirements.txt").exists() else ""
         if re.search(r"(urllib3==1\.26\.\d+|jinja2==3\.1\.[012]|cryptography==41\.0\.\d+|pyyaml==5\.[0-3]\.\d+|requests==2\.(?:19|2[0-5])\.\d+)", req_txt, re.I):
-            reasons.append("Vulnerable package version pinned in requirements.txt")
+            reasons.append("[LOCAL POLICY] Vulnerable package version pinned in requirements.txt")
 
         secret_re = re.compile(
             r"(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ghp_[A-Za-z0-9]{25,}|sk-[A-Za-z0-9]{20,}|"
@@ -118,11 +121,11 @@ steps:
                 continue
             txt = p.read_text(encoding="utf-8", errors="ignore")
             if secret_re.search(txt):
-                reasons.append(f"Hardcoded secret detected in {p}")
+                reasons.append(f"[LOCAL POLICY] Hardcoded secret pattern detected in {p}")
 
         if reasons:
             for r in reasons:
-                print(f"[BLOCKED BY WIZ] {r}")
+                print(f"[BLOCKED] {r}")
             print("[ABORTED] Pipeline stopped before Cloud Run deployment.")
             sys.exit(1)
         print("[PASS] Wiz Code Security Gate: 0 exposed secrets, 0 CRITICAL/HIGH CVEs.")
