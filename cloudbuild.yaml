@@ -74,7 +74,8 @@ steps:
             --client-id="$$WIZ_CLIENT_ID" \
             --client-secret="$$WIZ_CLIENT_SECRET" \
             --name="cymbal-health-v1-$COMMIT_SHA" \
-            --json-output-file="/workspace/wiz-dir-scan.json"
+            --json-output-file="/workspace/wiz-dir-scan.json" || echo "[GATE-WIZ] wizcli exited with a non-zero status; the verdict is taken from the JSON report."
+          export WIZ_LIVE_SCAN=1
         else
           echo "[GATE-WIZ] Wiz secret versions not yet loaded in Secret Manager; running policy gate..."
         fi
@@ -82,7 +83,10 @@ steps:
         import json, pathlib, re, sys
 
         reasons = []
+        import os
         wiz_json = pathlib.Path("/workspace/wiz-dir-scan.json")
+        if os.environ.get("WIZ_LIVE_SCAN") == "1" and not wiz_json.exists():
+            reasons.append("Wiz scan did not produce a report (failing closed)")
         if wiz_json.exists():
             raw = wiz_json.read_text(encoding="utf-8", errors="replace")
             try:
@@ -123,11 +127,15 @@ steps:
             if secret_re.search(txt):
                 reasons.append(f"[LOCAL POLICY] Hardcoded secret pattern detected in {p}")
 
+        gate_dir = pathlib.Path("/workspace/.security-gates")
+        gate_dir.mkdir(exist_ok=True)
         if reasons:
             for r in reasons:
                 print(f"[BLOCKED] {r}")
-            print("[ABORTED] Pipeline stopped before Cloud Run deployment.")
-            sys.exit(1)
+            (gate_dir / "wiz.blocked").write_text("\n".join(reasons) + "\n")
+            print("[GATE-WIZ] Verdict recorded: BLOCK (final decision in step security-verdict).")
+            sys.exit(0)
+        (gate_dir / "wiz.passed").write_text("ok\n")
         print("[PASS] Wiz Code Security Gate: 0 exposed secrets, 0 CRITICAL/HIGH CVEs.")
         PYEOF
 
@@ -202,15 +210,49 @@ steps:
             print(f"  [ACCEPTED {rid}] {f.get('severity')}: {f.get('title')}")
         for _, f in blocking:
             print(f"  [BLOCKING] {f.get('severity')}: {f.get('title')} ({str(f.get('file_path', '')).replace('/workspace/', '')}:{f.get('start_line')})")
+        import pathlib
+        gate_dir = pathlib.Path("/workspace/.security-gates")
+        gate_dir.mkdir(exist_ok=True)
         if blocking:
             print(f"[BLOCK] CodeMender Gate: {len(blocking)} new CRITICAL/HIGH finding(s). Pull request cannot be merged.")
-            sys.exit(1)
+            (gate_dir / "codemender.blocked").write_text("\n".join(f"{f.get('severity')}: {f.get('title')}" for _, f in blocking) + "\n")
+            sys.exit(0)
+        (gate_dir / "codemender.passed").write_text("ok\n")
         print(f"[PASS] CodeMender Gate: 0 new CRITICAL/HIGH findings ({len(accepted)} covered by accepted risks).")
         PY
 
+  - id: "security-verdict"
+    # Waits for every code gate so all findings are reported in the same run, then decides.
+    # Fails closed: a gate that did not record PASS counts as BLOCK.
+    name: "gcr.io/cloud-builders/gcloud"
+    waitFor: ["wizcli-v1-dir-scan", "codemender-sarif-gate"]
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        set -uo pipefail
+        D=/workspace/.security-gates
+        FAILED=0
+        echo "================ SECURITY VERDICT ================"
+        for g in wiz codemender; do
+          if [[ -f "$$D/$$g.passed" ]]; then
+            echo "[PASS]  $$g"
+          else
+            FAILED=1
+            echo "[BLOCK] $$g"
+            [[ -f "$$D/$$g.blocked" ]] && sed 's/^/          - /' "$$D/$$g.blocked" || echo "          - no verdict recorded (failing closed)"
+          fi
+        done
+        echo "=================================================="
+        if [[ "$$FAILED" -ne 0 ]]; then
+          echo "[ABORTED] Pull request blocked. Pipeline stopped before Cloud Run deployment."
+          exit 1
+        fi
+        echo "[PASS] All code security gates passed."
+
   - id: "wizcli-v1-container-scan"
     name: "gcr.io/cloud-builders/gcloud"
-    waitFor: ["push-artifact-registry", "pytest-and-least-privilege-gate", "wizcli-v1-dir-scan", "codemender-sarif-gate"]
+    waitFor: ["push-artifact-registry", "pytest-and-least-privilege-gate", "security-verdict"]
     entrypoint: "bash"
     args:
       - "-c"
