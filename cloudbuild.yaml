@@ -8,6 +8,9 @@ substitutions:
   _AR_REPO: "cymbal-health-repo"
   _PORTAL_SERVICE: "cymbal-health-web-portal-v1"
   _DEPLOY_ON_GREEN: "false"
+  _CM_VERSION: "0.21.0"
+  _CM_MODEL: "gemini-3.5-flash"
+  _CM_SHA256: "a14640643fa8f3678a7c918b27f998bfdabe8b72ad9d1b9723a3a55fd64f90df"
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -126,20 +129,81 @@ steps:
         PYEOF
 
   - id: "codemender-sarif-gate"
-    name: "python:3.12-slim"
+    # Real CodeMender scan of the application code. Fails CLOSED: if the CLI cannot be
+    # installed, authenticated or the report cannot be parsed, the build fails.
+    name: "gcr.io/cloud-builders/gcloud"
     waitFor: ["-"]
     entrypoint: "bash"
+    env:
+      - "CM_PLAIN=true"
+      - "GOOGLE_CLOUD_PROJECT=$PROJECT_ID"
     args:
       - "-c"
       - |
         set -euo pipefail
-        export CM_PLAIN=true
-        echo "[GATE-CM] Running CodeMender semantic security invariant scan (CM_PLAIN=true)..."
-        if command -v cm >/dev/null 2>&1; then
-          cm --plain find . --diff --model gemini-3.8-flash-cyber --format sarif --output /workspace/cm-results.sarif --fail-on CRITICAL,HIGH -y
-        else
-          echo "[PASS] CodeMender Gate: 0 verified exploitable CRITICAL/HIGH findings."
-        fi
+        echo "[GATE-CM] Installing CodeMender CLI ${_CM_VERSION} from private Artifact Registry (cymbal-health-tools)..."
+        mkdir -p /tmp/cmdl
+        gcloud artifacts generic download --project="$PROJECT_ID" --location="${_REGION}" \
+          --repository=cymbal-health-tools --package=codemender-cli --version="${_CM_VERSION}" \
+          --destination=/tmp/cmdl --quiet
+        install -m 0755 /tmp/cmdl/cm /usr/local/bin/cm
+        echo "${_CM_SHA256}  /usr/local/bin/cm" | sha256sum -c -
+        cm init -y >/dev/null
+        cm health
+        echo "[GATE-CM] Scanning backend/ with CodeMender (model ${_CM_MODEL})..."
+        cm find backend --quick --model "${_CM_MODEL}" --format json \
+          --output /tmp/codemender-report.json -y || true
+        gcloud storage cp /tmp/codemender-report.json \
+          "gs://cymbal-health-cb-logs-$PROJECT_NUMBER/codemender/$BUILD_ID.json" --quiet || true
+        python3 - << 'PY'
+        import datetime, json, sys
+        try:
+            findings = json.load(open("/tmp/codemender-report.json"))
+            if isinstance(findings, dict):
+                findings = findings.get("findings", [])
+        except Exception as exc:
+            print(f"[FAIL] CodeMender Gate: report missing or unreadable ({exc}). Failing closed.")
+            sys.exit(1)
+        try:
+            risks = json.load(open(".codemender/accepted-risks.json")).get("accepted_risks", [])
+        except FileNotFoundError:
+            risks = []
+        today = datetime.date.today().isoformat()
+        active = [r for r in risks if r.get("expires_on", "0000-00-00") >= today]
+        for r in risks:
+            if r not in active:
+                print(f"[GATE-CM] Accepted risk {r.get('id')} expired on {r.get('expires_on')}; its findings block again.")
+
+        def accepted_by(finding):
+            path = str(finding.get("file_path", "")).replace("/workspace/", "")
+            text = " ".join(str(finding.get(k, "")) for k in ("title", "vuln_type", "snippet")).lower()
+            for r in active:
+                if path != r.get("file"):
+                    continue
+                if not any(fn.lower() in text for fn in r.get("functions", [])):
+                    continue
+                if any(kw in text for kw in r.get("match_keywords", [])):
+                    return r.get("id")
+            return None
+
+        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        blocking, accepted = [], []
+        for f in findings:
+            sev = str(f.get("severity", "")).upper()
+            counts[sev] = counts.get(sev, 0) + 1
+            if sev in ("CRITICAL", "HIGH"):
+                rid = accepted_by(f)
+                (accepted if rid else blocking).append((rid, f))
+        print("[GATE-CM] Findings by severity: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+        for rid, f in accepted:
+            print(f"  [ACCEPTED {rid}] {f.get('severity')}: {f.get('title')}")
+        for _, f in blocking:
+            print(f"  [BLOCKING] {f.get('severity')}: {f.get('title')} ({str(f.get('file_path', '')).replace('/workspace/', '')}:{f.get('start_line')})")
+        if blocking:
+            print(f"[BLOCK] CodeMender Gate: {len(blocking)} new CRITICAL/HIGH finding(s). Pull request cannot be merged.")
+            sys.exit(1)
+        print(f"[PASS] CodeMender Gate: 0 new CRITICAL/HIGH findings ({len(accepted)} covered by accepted risks).")
+        PY
 
   - id: "wizcli-v1-container-scan"
     name: "gcr.io/cloud-builders/gcloud"
@@ -199,4 +263,4 @@ images:
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_PORTAL_SERVICE}:$COMMIT_SHA"
   - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_PORTAL_SERVICE}:v1"
 
-timeout: "600s"
+timeout: "1200s"
