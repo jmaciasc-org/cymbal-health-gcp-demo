@@ -110,10 +110,12 @@ def healthz() -> dict[str, Any]:
 def readyz(response: Response) -> dict[str, Any]:
     """Readiness probe: verifies the database connection (Cloud SQL over private IP with IAM auth)."""
     database = check_database_connection()
-    if not database.get("connected"):
+    connected = bool(database.get("connected"))
+    if not connected:
         response.status_code = 503
     response.headers.update(NO_CACHE_HEADERS)
-    return {"status": "ready" if database.get("connected") else "not_ready", "database": database}
+    # Public response is intentionally minimal; instance, principal and errors go to Cloud Logging only.
+    return {"status": "ready" if connected else "not_ready", "database": {"engine": database["engine"], "connected": connected}}
 
 
 @app.get("/api/orders/defaults")
