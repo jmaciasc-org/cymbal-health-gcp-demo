@@ -257,6 +257,7 @@ def check_database_connection() -> dict[str, Any]:
                 metadata["current_user"] = conn.execute(text("SELECT current_user")).scalar_one()
                 metadata["server_version"] = conn.execute(text("SHOW server_version")).scalar_one()
         metadata["connected"] = True
+        logger.info("Database readiness check passed", extra={"database": metadata})
     except Exception as exc:  # pragma: no cover - surfaced to readiness probe
         logger.exception("Database readiness check failed")
         metadata["connected"] = False

@@ -428,4 +428,4 @@ def test_readiness_probe_reports_database_backend() -> None:
     assert body["status"] == "ready"
     assert body["database"]["connected"] is True
     assert body["database"]["engine"] == "sqlite-local-mirror"
-    assert body["database"]["static_password_configured"] is False
+    assert set(body["database"]) == {"engine", "connected"}
