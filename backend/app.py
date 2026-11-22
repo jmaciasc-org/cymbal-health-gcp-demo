@@ -20,6 +20,7 @@ from backend.clinical_agent_adk import (
 )
 from backend.datastore_rag import get_datastore_metadata
 from backend.db import (
+    check_database_connection,
     create_clinical_order,
     get_iam_db_auth_metadata,
     get_public_order,
@@ -115,6 +116,18 @@ def healthz() -> dict[str, Any]:
         "asset_version": _ASSET_VER,
         "auth_mode": "adc_iam_keyless",
     }
+
+
+@app.get("/readyz")
+def readyz(response: Response) -> dict[str, Any]:
+    """Readiness probe: verifies the database connection (Cloud SQL over private IP with IAM auth)."""
+    database = check_database_connection()
+    connected = bool(database.get("connected"))
+    if not connected:
+        response.status_code = 503
+    response.headers.update(NO_CACHE_HEADERS)
+    # Public response is intentionally minimal; instance, principal and errors go to Cloud Logging only.
+    return {"status": "ready" if connected else "not_ready", "database": {"engine": database["engine"], "connected": connected}}
 
 
 @app.get("/api/config")
