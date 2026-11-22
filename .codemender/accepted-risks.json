@@ -1,0 +1,29 @@
+{
+  "description": "Riesgos aceptados formalmente para el gate de CodeMender. Un hallazgo CRITICAL/HIGH solo deja de bloquear si coincide con una entrada vigente. Las entradas vencidas se ignoran y el hallazgo vuelve a bloquear.",
+  "accepted_risks": [
+    {
+      "id": "CH-RISK-001",
+      "title": "Endpoints del portal v1 sin autenticacion de usuario (incluye acceso directo por ID a ordenes y soportes PDF)",
+      "file": "backend/app.py",
+      "functions": [
+        "api_list_orders",
+        "api_search_orders",
+        "api_create_order",
+        "api_get_order_detail",
+        "api_download_order_pdf"
+      ],
+      "match_keywords": ["authentication", "authorization", "access control", "idor", "direct object reference"],
+      "justification": "Entorno de demostracion con datos 100% sinteticos (sin pacientes reales). La vista clinical_orders_public_v excluye registros confidenciales y los documentos estan enmascarados.",
+      "compensating_controls": [
+        "Cloud Armor WAF (OWASP CRS v33) y rate limiting de 120 req/60s por IP",
+        "Cloud Run solo accesible via Load Balancer (ingress internal-and-cloud-load-balancing)",
+        "Rol de base de datos cymbal_portal_rw sin DELETE ni TRUNCATE",
+        "Cloud Audit Logs Data Access hacia Google SecOps y Wiz"
+      ],
+      "remediation_plan": "Habilitar Identity-Aware Proxy en el backend del Load Balancer y validar el JWT x-goog-iap-jwt-assertion en la aplicacion.",
+      "owner": "Ingenieria de Plataforma (aprobado por Oficina del CISO)",
+      "approved_on": "2026-11-22",
+      "expires_on": "2026-12-31"
+    }
+  ]
+}

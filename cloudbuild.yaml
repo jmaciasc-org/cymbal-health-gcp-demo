@@ -156,7 +156,7 @@ steps:
         gcloud storage cp /tmp/codemender-report.json \
           "gs://cymbal-health-cb-logs-$PROJECT_NUMBER/codemender/$BUILD_ID.json" --quiet || true
         python3 - << 'PY'
-        import json, sys
+        import datetime, json, sys
         try:
             findings = json.load(open("/tmp/codemender-report.json"))
             if isinstance(findings, dict):
@@ -164,18 +164,45 @@ steps:
         except Exception as exc:
             print(f"[FAIL] CodeMender Gate: report missing or unreadable ({exc}). Failing closed.")
             sys.exit(1)
+        try:
+            risks = json.load(open(".codemender/accepted-risks.json")).get("accepted_risks", [])
+        except FileNotFoundError:
+            risks = []
+        today = datetime.date.today().isoformat()
+        active = [r for r in risks if r.get("expires_on", "0000-00-00") >= today]
+        for r in risks:
+            if r not in active:
+                print(f"[GATE-CM] Accepted risk {r.get('id')} expired on {r.get('expires_on')}; its findings block again.")
+
+        def accepted_by(finding):
+            path = str(finding.get("file_path", "")).replace("/workspace/", "")
+            text = " ".join(str(finding.get(k, "")) for k in ("title", "vuln_type", "snippet")).lower()
+            for r in active:
+                if path != r.get("file"):
+                    continue
+                if not any(fn.lower() in text for fn in r.get("functions", [])):
+                    continue
+                if any(kw in text for kw in r.get("match_keywords", [])):
+                    return r.get("id")
+            return None
+
         counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-        for item in findings:
-            sev = str(item.get("severity", "")).upper()
+        blocking, accepted = [], []
+        for f in findings:
+            sev = str(f.get("severity", "")).upper()
             counts[sev] = counts.get(sev, 0) + 1
+            if sev in ("CRITICAL", "HIGH"):
+                rid = accepted_by(f)
+                (accepted if rid else blocking).append((rid, f))
         print("[GATE-CM] Findings by severity: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
-        blocking = [f for f in findings if str(f.get("severity", "")).upper() in ("CRITICAL", "HIGH")]
-        for f in blocking:
-            print(f"  - {f.get('severity')}: {f.get('title')} ({f.get('file_path', '').replace('/workspace/', '')})")
+        for rid, f in accepted:
+            print(f"  [ACCEPTED {rid}] {f.get('severity')}: {f.get('title')}")
+        for _, f in blocking:
+            print(f"  [BLOCKING] {f.get('severity')}: {f.get('title')} ({str(f.get('file_path', '')).replace('/workspace/', '')}:{f.get('start_line')})")
         if blocking:
-            print(f"[BLOCK] CodeMender Gate: {len(blocking)} CRITICAL/HIGH finding(s). Pull request cannot be merged.")
+            print(f"[BLOCK] CodeMender Gate: {len(blocking)} new CRITICAL/HIGH finding(s). Pull request cannot be merged.")
             sys.exit(1)
-        print("[PASS] CodeMender Gate: 0 CRITICAL/HIGH findings.")
+        print(f"[PASS] CodeMender Gate: 0 new CRITICAL/HIGH findings ({len(accepted)} covered by accepted risks).")
         PY
 
   - id: "wizcli-v1-container-scan"
