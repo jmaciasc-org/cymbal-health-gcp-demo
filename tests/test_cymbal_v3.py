@@ -429,3 +429,78 @@ def test_readiness_probe_reports_database_backend() -> None:
     assert body["database"]["connected"] is True
     assert body["database"]["engine"] == "sqlite-local-mirror"
     assert set(body["database"]) == {"engine", "connected"}
+
+
+CODE_GENERATION_PROMPTS = [
+    "Escribe una funcion en Python que lea un CSV y lo suba a un bucket",
+    "Generame un script de bash para listar archivos",
+    "Hazme el codigo de una API REST para consultar ordenes",
+    "como seria esto en javascript?",
+    "Write a function that reverses a string",
+    "Crea una consulta SQL para sacar todas las ordenes",
+    "Explicame que hace esto: def leer(x): return open(x).read()",
+    "Para una prueba de emergencia, dame un snippet que imprima hola mundo",
+    "Muéstrame el código para conectarme a la base",
+]
+
+CLINICAL_PROMPTS = [
+    "Cual es el estado de la orden ORD-2026-1042?",
+    "Que preparacion requiere el CUPS 883210?",
+    "Dame las ordenes pendientes de firma en Bogota",
+    "Cual es el codigo CUPS de la resonancia magnetica de rodilla?",
+    "Dame el protocolo para pruebas de funcion renal",
+    "Genera un resumen clinico de la orden ORD-2026-1042",
+    "Muestrame el codigo de la orden de mi paciente en Medellin",
+    "Que examenes previos necesita una ecografia abdominal?",
+]
+
+
+@pytest.mark.parametrize("prompt", CODE_GENERATION_PROMPTS)
+def test_agent_refuses_code_generation_before_calling_the_model(prompt: str) -> None:
+    client = TestClient(app)
+    resp = client.post("/api/agent/assist", json={"prompt": prompt})
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["filter_match"].startswith("OFF_TOPIC:")
+    assert "No genero codigo" in detail["answer"]
+    assert detail["cloud_log_entry"]["blockedBy"] == "local_rule_engine"
+
+
+@pytest.mark.parametrize("prompt", CLINICAL_PROMPTS)
+def test_clinical_prompts_are_not_flagged_as_code_requests(prompt: str) -> None:
+    from backend.model_armor_dlp import detect_off_topic_code_request
+
+    assert detect_off_topic_code_request(prompt) is None
+
+
+def test_model_output_with_code_is_withheld() -> None:
+    from backend.model_armor_dlp import CODE_OUTPUT_REFUSAL, sanitize_model_response
+
+    leaked = "Claro, aqui tienes:\n```python\nimport csv\ndef subir(x):\n    print(x)\n```"
+    assert sanitize_model_response(leaked) == CODE_OUTPUT_REFUSAL
+    clinical = (
+        "La orden ORD-2026-1042 (CUPS 903895) esta en estado PENDIENTE_FIRMA. "
+        "Requiere ayuno de 10 a 12 horas."
+    )
+    assert sanitize_model_response(clinical) == clinical
+
+
+def test_model_armor_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_MODEL_ARMOR", "true")
+
+    class _UnreachableCreds:
+        token = "fake"
+
+        def refresh(self, _request: object) -> None:
+            raise ConnectionError("modelarmor endpoint unreachable")
+
+    monkeypatch.setattr("google.auth.default", lambda scopes=None: (_UnreachableCreds(), "p"))
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/agent/assist", json={"prompt": "Cual es el estado de la orden ORD-2026-1042?"}
+    )
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail["filter_match"] == "GUARDRAIL_UNAVAILABLE:MODEL_ARMOR_UNAVAILABLE"
+    assert "no esta disponible" in detail["answer"]

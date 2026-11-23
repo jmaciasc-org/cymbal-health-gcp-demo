@@ -23,13 +23,33 @@ import json
 import logging
 import os
 import re
+import sys
 import time
+import unicodedata
 import uuid
 from typing import Any
 
 from backend.datastore_rag import ProtocolChunk
 
 logger = logging.getLogger("cymbal.security.guardrail")
+if not logger.handlers:
+    # Cloud Run only ingests stdout/stderr; without an explicit handler the INFO
+    # verdict entries were dropped by the root logger (WARNING by default).
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+MODEL_ARMOR_UNAVAILABLE = "MODEL_ARMOR_UNAVAILABLE"
+OFF_TOPIC_REFUSAL = (
+    "Solicitud fuera del alcance del asistente clinico: solo puedo validar ordenes "
+    "y protocolos clinicos de Cymbal Health. No genero codigo, scripts ni consultas SQL."
+)
+CODE_OUTPUT_REFUSAL = (
+    "Respuesta retenida por politica de salida: el asistente clinico no genera codigo, "
+    "scripts ni consultas SQL."
+)
 
 _TELEMETRY_BUFFER: deque[dict[str, Any]] = deque(maxlen=50)
 
@@ -87,6 +107,69 @@ _PI_JAILBREAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
 ]
+
+_CODE_LANGUAGES = (
+    r"python|javascript|typescript|java|bash|shell|powershell|sql|c\+\+|c#|golang|rust|php|"
+    r"ruby|kotlin|swift|html|css|node(?:\.?js)?|react|terraform|yaml|dockerfile"
+)
+_CODE_OBJECTS = (
+    r"codigo(?!\s+(?:de\s+(?:la\s+|el\s+)?)?(?:cups|cie|orden|ord\b|autorizacion|procedimiento|diagnostico|folio))|"
+    r"code|funcion(?!\s+(?:renal|hepatic\w*|pulmonar\w*|cardiac\w*|tiroide\w*|ventricular|respiratori\w*|"
+    r"cognitiv\w*|motor\w*|vital\w*|organic\w*|sistolic\w*|diastolic\w*))|function|script|program|"
+    r"class|snippet|regex|expresion\s+regular|consulta\s+sql|query|endpoint|api\s+rest"
+)
+_OFF_TOPIC_CODE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "CODE_GENERATION_REQUEST",
+        re.compile(
+            r"\b(?:escrib\w*|gener\w*|crea\w*|haz\w*|dame|programa\w*|codific\w*|implement\w*|"
+            r"desarroll\w*|constru\w*|muestrame|write|generate|create|build|implement|give\s+me|show\s+me)"
+            r"\b[^.?!]{0,60}?\b(?:" + _CODE_OBJECTS + r")\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CODE_LANGUAGE_REQUEST",
+        re.compile(
+            r"\b(?:en|in|usando|using|con|with)\s+(?:lenguaje\s+)?(?:" + _CODE_LANGUAGES + r")(?![\w])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "CODE_TOKENS_IN_PROMPT",
+        re.compile(
+            r"(```|#!/|<script\b|\bdef\s+\w+\s*\(|\bimport\s+[a-z_][\w.]*|\bfunction\s+\w*\s*\(|"
+            r"\bconsole\.log\b|\bprint\s*\()",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+_CODE_OUTPUT_PATTERN = re.compile(
+    r"(```|^\s*(?:def|class|import|from\s+\S+\s+import|function|const|let|var|public\s+(?:static\s+)?\w+|"
+    r"#include|package\s+\w+|SELECT\s+.+\s+FROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|#!/)\b|"
+    r"<script\b|=>\s*\{|\bconsole\.log\(|\bprint\(|\bpip\s+install\b|\bnpm\s+install\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _normalize_for_matching(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def detect_off_topic_code_request(text: str) -> str | None:
+    """Deterministic scope gate: the clinical agent never generates code, scripts or SQL."""
+    normalized = _normalize_for_matching(text)
+    for rule_name, pattern in _OFF_TOPIC_CODE_PATTERNS:
+        if pattern.search(normalized):
+            return rule_name
+    return None
+
+
+def response_contains_code(text: str) -> bool:
+    return bool(_CODE_OUTPUT_PATTERN.search(text or ""))
+
 
 _PAYMENT_CARD_PATTERN = re.compile(r"\b(?:\d{4}[-\s]?){3}\d{1,4}\b")
 
@@ -164,9 +247,11 @@ def mask_colombian_pii_dlp(text: str) -> tuple[str, list[str]]:
 
 
 def _check_live_model_armor_user_prompt(text: str, template_name: str) -> str | None:
-    """Optional live Google Cloud Model Armor `sanitizeUserPrompt` call via ADC."""
+    """Live Google Cloud Model Armor `sanitizeUserPrompt` call via ADC (fail closed)."""
     if os.getenv("ENABLE_LIVE_MODEL_ARMOR", "false").lower() != "true":
         return None
+    fail_closed = os.getenv("MODEL_ARMOR_FAIL_CLOSED", "true").lower() != "false"
+    error_detail = ""
     try:
         import google.auth
         from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -178,23 +263,36 @@ def _check_live_model_armor_user_prompt(text: str, template_name: str) -> str | 
         credentials.refresh(GoogleAuthRequest())
         location = os.getenv("GCP_REGION", "us-central1")
         endpoint = f"https://modelarmor.{location}.rep.googleapis.com/v1/{template_name}:sanitizeUserPrompt"
-        with httpx.Client(timeout=2.5) as client:
+        timeout_s = float(os.getenv("MODEL_ARMOR_TIMEOUT_SECONDS", "5"))
+        with httpx.Client(timeout=timeout_s) as client:
             resp = client.post(
                 endpoint,
                 headers={"Authorization": f"Bearer {credentials.token}"},
                 json={"userPromptData": {"text": text}},
             )
-            if resp.status_code == 200:
-                verdict_state = (
-                    resp.json()
-                    .get("sanitizationResult", {})
-                    .get("filterMatchState", "")
-                )
-                if verdict_state == "MATCH_FOUND":
-                    return "MODEL_ARMOR_API_MATCH"
-    except Exception:
-        pass
-    return None
+        if resp.status_code == 200:
+            verdict_state = (
+                resp.json()
+                .get("sanitizationResult", {})
+                .get("filterMatchState", "")
+            )
+            return "MODEL_ARMOR_API_MATCH" if verdict_state == "MATCH_FOUND" else None
+        error_detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:  # noqa: BLE001 - any failure must be visible and fail closed
+        error_detail = f"{type(exc).__name__}: {exc}"[:300]
+    logger.warning(
+        json.dumps(
+            {
+                "severity": "ERROR",
+                "event": "model_armor_call_failed",
+                "modelArmorTemplate": template_name,
+                "failClosed": fail_closed,
+                "error": error_detail,
+            },
+            ensure_ascii=True,
+        )
+    )
+    return MODEL_ARMOR_UNAVAILABLE if fail_closed else None
 
 
 def sanitize_rag_chunks(chunks: list[ProtocolChunk]) -> tuple[list[ProtocolChunk], int]:
@@ -237,6 +335,14 @@ def sanitize_model_response(response_text: str) -> str:
     """Ring 1c: Scrubs model output against accidental PII, schema/resource names, or system prompt leakage."""
     masked_out, _ = mask_colombian_pii_dlp(response_text)
     masked_out = _INTERNAL_IDENTIFIER_PATTERN.sub("[INTERNAL_RESOURCE_REDACTED]", masked_out)
+    if response_contains_code(masked_out):
+        logger.warning(
+            json.dumps(
+                {"severity": "WARNING", "event": "model_output_code_blocked", "preview": masked_out[:160]},
+                ensure_ascii=True,
+            )
+        )
+        return CODE_OUTPUT_REFUSAL
     if re.search(r"SYSTEM_INSTRUCTION_CONFIDENTIAL_MARKER", masked_out):
         return "Respuesta retenida por politica de seguridad de salida de Model Armor."
     return masked_out
@@ -270,8 +376,17 @@ def inspect_and_sanitize_prompt(
             matched_rule = rule_name
             break
 
+    filter_family = "PI_AND_JAILBREAK"
+    if matched_rule is None:
+        off_topic_rule = detect_off_topic_code_request(raw_prompt)
+        if off_topic_rule is not None:
+            matched_rule = off_topic_rule
+            filter_family = "OFF_TOPIC"
+
     if matched_rule is None:
         matched_rule = _check_live_model_armor_user_prompt(raw_prompt, model_armor_template)
+        if matched_rule == MODEL_ARMOR_UNAVAILABLE:
+            filter_family = "GUARDRAIL_UNAVAILABLE"
 
     sanitized_prompt, dlp_info_types = mask_colombian_pii_dlp(raw_prompt)
     elapsed_ms = round((time.perf_counter() - start) * 1000.0, 2)
@@ -282,7 +397,7 @@ def inspect_and_sanitize_prompt(
         if (allowed and dlp_info_types)
         else ("ALLOW" if allowed else "BLOCKED")
     )
-    filter_match = None if allowed else f"PI_AND_JAILBREAK:{matched_rule}"
+    filter_match = None if allowed else f"{filter_family}:{matched_rule}"
     udm_query = build_secops_udm_query(resolved_trace, caller_ip, principal_email)
 
     log_entry: dict[str, Any] = {
@@ -300,6 +415,11 @@ def inspect_and_sanitize_prompt(
         "dlpDeidentifyTemplate": dlp_deidentify_template,
         "dlpInfoTypes": dlp_info_types,
         "sanitizedPreview": sanitized_prompt[:160],
+        "blockedBy": (
+            None
+            if allowed
+            else ("model_armor_api" if matched_rule == "MODEL_ARMOR_API_MATCH" else "local_rule_engine")
+        ),
         "latencyMs": elapsed_ms,
         "secopsUdmQuery": udm_query,
     }
