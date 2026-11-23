@@ -19,6 +19,7 @@ from backend.db import (
     list_public_orders,
     search_orders,
 )
+from backend.eps_sync import export_orders_for_eps
 from backend.seed_data import DEFAULT_PREFILLED_ORDER
 from backend.storage_client import (
     fetch_order_support_pdf,
@@ -116,6 +117,12 @@ def readyz(response: Response) -> dict[str, Any]:
     response.headers.update(NO_CACHE_HEADERS)
     # Public response is intentionally minimal; instance, principal and errors go to Cloud Logging only.
     return {"status": "ready" if connected else "not_ready", "database": {"engine": database["engine"], "connected": connected}}
+
+
+@app.get("/api/eps/export")
+def api_export_eps_orders(eps: str = Query(default="Sanitas", max_length=200)) -> dict[str, Any]:
+    items = export_orders_for_eps(eps)
+    return {"eps": eps, "count": len(items), "items": items}
 
 
 @app.get("/api/orders/defaults")

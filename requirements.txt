@@ -2,7 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 httpx==0.28.1
-urllib3==2.2.3
+urllib3==1.26.4  # requerido por el SDK de integracion EPS
 cryptography==44.0.1
 google-auth==2.37.0
 requests==2.32.3
